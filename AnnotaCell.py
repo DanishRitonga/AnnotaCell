@@ -1,5 +1,73 @@
-import pandas as pd 
-import requests, json, csv
+import pandas as pd
+import numpy as np
+import os, requests, json, csv
+import psycopg2
+import os
+from openai import OpenAI
+from tavily import TavilyClient
+from dotenv import load_dotenv
+
+# Function to load ontology into memory
+def load_ontology_from_db() -> dict:
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    cur = conn.cursor()
+
+    ontology_data = {
+        "uberon-tissue": {},
+        "cl-cell": {},
+        "ensembl-gene": {}
+    }
+
+    table_mappings = [
+        ("TISSUE", "UBERON", "tissueName", "uberon-tissue"),
+        ("CELL", "CL", "cellName", "cl-cell"),
+        ("GENE", "ENSEMBL", "geneName", "ensembl-gene")
+    ]
+
+    for table, key_col, value_col, json_key in table_mappings:
+        cur.execute(f"SELECT {key_col}, {value_col} FROM {table}")
+        rows = cur.fetchall()
+        ontology_data[json_key] = {key: value for key, value in rows}
+
+    cur.close()
+    conn.close()
+
+    return ontology_data
+
+class ontl:
+    _ontology_dict = None  # Class-level cache
+
+    @classmethod
+    def _load_ontology(cls):
+        if cls._ontology_dict is None:
+            cls._ontology_dict = load_ontology_from_db()
+
+    @classmethod
+    def tissue(cls, value: str, rev: bool = False) -> str | None:
+        cls._load_ontology()
+        table = cls._ontology_dict.get("uberon-tissue", {})
+        return (
+            next((k for k, v in table.items() if v.lower() == value.lower()), None)
+            if rev else table.get(value)
+        )
+
+    @classmethod
+    def cell(cls, value: str, rev: bool = False) -> str | None:
+        cls._load_ontology()
+        table = cls._ontology_dict.get("cl-cell", {})
+        return (
+            next((k for k, v in table.items() if v.lower() == value.lower()), None)
+            if rev else table.get(value)
+        ) 
+
+    @classmethod
+    def gene(cls, value: str, rev: bool = False) -> str | None:
+        cls._load_ontology()
+        table = cls._ontology_dict.get("ensembl-gene", {})
+        return (
+            next((k for k, v in table.items() if v.lower() == value.lower()), None)
+            if rev else table.get(value)
+        )
 
 #Input and Preprocess Data
 def csv_read(file_path):
@@ -7,6 +75,7 @@ def csv_read(file_path):
         sample = file.read(1024) 
         file.seek(0)
         detected_delimiter = csv.Sniffer().sniff(sample).delimiter    
+    # Read the file with the detected delimiter
     df = pd.read_csv(file_path, sep=detected_delimiter)
     return df
 
@@ -23,14 +92,8 @@ def extract_clusters(df):
     return pd.DataFrame({cluster: genes + [None] * (max_length - len(genes)) for cluster, genes in grouped.items()})
 
 def translate_genes(clustered_df):
-    # Load the Ensembl ID mapping from JSON
-    with open('dictionary.json', 'r') as file:
-        gene_to_ensembl = json.load(file)["ensembl_to_gene"]
-
-    ensembl_to_gene = {v: k for k, v in gene_to_ensembl.items()}
-
     # Translate gene names to Ensembl IDs in the clustered DataFrame
-    return clustered_df.apply(lambda col: col.map(lambda gene: ensembl_to_gene.get(gene, None) if pd.notna(gene) else None))
+    return clustered_df.apply(lambda col: col.map(lambda gene: ontl.gene(gene, rev=True) if pd.notna(gene) else None))
 
 def data_preprocessing(df):
     extracted_df = extract_clusters(df)
@@ -85,90 +148,96 @@ def filter_expression_data(response_df, TARGET_UBERON_ID):
     return tissue_df[~tissue_df['cell'].isin(['tissue_stats', 'CL:0000000'])]
 
 def translate_ontology(df):
-    with open('cell_dict.json', 'r') as cell_file, open('ensembl_to_gene.json', 'r') as gene_file:
-        cl_to_cell = json.load(cell_file)
-        ensembl_to_gene = json.load(gene_file)
-
-    df['cell'] = df['cell'].map(cl_to_cell)
-    df['gene'] = df['gene'].map(ensembl_to_gene).fillna(df['gene'])
+    df['cell'] = df['cell'].apply(lambda x: ontl.cell(x))
+    df['gene'] = df['gene'].apply(lambda x: ontl.gene(x)).fillna(df['gene'])
 
     return df
 
-def transform_results(results):
-    # Count the number of entries for each cell
-    cell_counts = results['cell'].value_counts().reset_index()
-    cell_counts.columns = ['cell', 'count']
+def calculate_cell_score(
+    results,
+    w_e=1.0, w_p=1.5, w_ct=2.5,             # base score weights
+    w_m=7.0, w_f=3.0,                       # mean vs flatness weights
+    alpha=1.0, beta=1.0, gamma=1.0,         # flatness breakdown
+    w_c=1.0                                 # count weight
+):
+    import pandas as pd
+    import numpy as np
 
-    # Merge the counts back to the original DataFrame
-    merged_df = results.merge(cell_counts, on='cell')
-
-    # Sort the DataFrame based on the count of entries in descending order
-    return merged_df.groupby(['cell', 'gene']).first().sort_values(by=['count', 'cell', 'expression', 'cell percentage'], ascending=[False, True, False, False]).reset_index().drop(columns=['count'])
-
-def calculate_cell_score(results):
     cell_df = results.copy()
 
-    # Group by 'cell' and calculate the total cell count for each group
+    # Calculate total cell count per cell
     sum_cell_count = cell_df.groupby('cell')['cell count'].sum().reset_index()
     sum_cell_count.columns = ['cell', 'total cell count']
     cell_df = cell_df.merge(sum_cell_count, on='cell')
 
-    cell_df = cell_df[cell_df['total cell count'] >= 100]
+    # Adaptive cutoff: max(μ - 0.5σ, min(total count))
+    mu = cell_df['total cell count'].mean()
+    sigma = cell_df['total cell count'].std()
+    minimum = cell_df['total cell count'].min()
+    min_count = max(mu - 0.5 * sigma, minimum)
+    cell_df = cell_df[cell_df['total cell count'] >= min_count]
 
-    # Calculate scores
-    cell_df['score'] = (1) * ((cell_df['expression'] - cell_df['expression'].min()) / (cell_df['expression'].max() - cell_df['expression'].min())) + (1.5) * (cell_df['cell percentage']) + (2.5) * ((cell_df['cell count'] - cell_df['cell count'].min()) / (cell_df['cell count'].max() - cell_df['cell count'].min()))
+    # Normalize expression and cell count
+    norm_expr = (cell_df['expression'] - cell_df['expression'].min()) / (cell_df['expression'].max() - cell_df['expression'].min())
+    norm_count = (cell_df['cell count'] - cell_df['cell count'].min()) / (cell_df['cell count'].max() - cell_df['cell count'].min())
 
-    # Group by 'cell' and calculate the standard deviation of 'score' for each group
-    std_scores = cell_df.groupby('cell')['score'].std().reset_index()
-    std_scores.columns = ['cell', 'std']
+    # Compute base score
+    cell_df['score'] = (
+        w_e * norm_expr +
+        w_p * cell_df['cell percentage'] +
+        w_ct * norm_count
+    )
+
+    # Compute flatness components
+    std_scores = cell_df.groupby('cell')['score'].std().reset_index().rename(columns={'score': 'std'})
+    mean_scores = cell_df.groupby('cell')['score'].mean().reset_index().rename(columns={'score': 'mean'})
+    kurtosis_scores = cell_df.groupby('cell')['score'].apply(pd.Series.kurt).reset_index(name='kurtosis')
+
     cell_df = cell_df.merge(std_scores, on='cell')
-
-    # Group by 'cell' and calculate the mean of 'score' for each group
-    mean_scores = cell_df.groupby('cell')['score'].mean().reset_index().fillna(0)
-    mean_scores.columns = ['cell', 'mean']
     cell_df = cell_df.merge(mean_scores, on='cell')
-
-    # Calculate the coefficient of variation (CV) for each cell
-    cell_df['CV'] = cell_df['std'] / cell_df['mean']
-
-    # Group by 'cell' and calculate the kurtosis of 'score' for each group
-    kurtosis_scores = cell_df.groupby('cell')['score'].apply(pd.Series.kurt).reset_index()
-    kurtosis_scores.columns = ['cell', 'kurtosis']
     cell_df = cell_df.merge(kurtosis_scores, on='cell')
 
-    # Normalize the scores
-    cell_df['std norm'] = (cell_df['std'] - cell_df['std'].min()) / (cell_df['std'].max() - cell_df['std'].min())
-    cell_df['mean norm'] = (cell_df['mean'] - cell_df['mean'].min()) / (cell_df['mean'].max() - cell_df['mean'].min())
-    cell_df['CV norm'] = (cell_df['CV'] - cell_df['CV'].min()) / (cell_df['CV'].max() - cell_df['CV'].min())
-    cell_df['kurtosis norm'] = ((cell_df['kurtosis'] - cell_df['kurtosis'].min()) / (cell_df['kurtosis'].max() - cell_df['kurtosis'].min()))
+    cell_df['CV'] = cell_df['std'] / (cell_df['mean'].replace(0, np.nan))
 
-    # Count the number of entries for each cell
+    # Normalize flatness metrics
+    for col in ['std', 'CV', 'kurtosis', 'mean']:
+        col_min, col_max = cell_df[col].min(), cell_df[col].max()
+        cell_df[f'{col} norm'] = (cell_df[col] - col_min) / (col_max - col_min + 1e-9)
+
+    # Stability (flatness) score
+    stability = (
+        alpha * (1 - cell_df['std norm'].fillna(0)) +
+        beta * (1 - cell_df['CV norm'].fillna(0)) +
+        gamma * (1 - cell_df['kurtosis norm'].fillna(0))
+    )
+    flatness_weight = stability / (alpha + beta + gamma)
+
+    # Count-based log-scaled soft weight
     cell_counts = cell_df['cell'].value_counts().reset_index()
     cell_counts.columns = ['cell', 'count']
     cell_df = cell_df.merge(cell_counts, on='cell')
 
-    cell_df['cell score'] = (0.1 * (1 - cell_df['std norm']).fillna(0) + 0.7 * cell_df['mean norm'] + 0.1 * (1 - cell_df['CV norm']) + 0.1 * (1 - cell_df['kurtosis norm']).fillna(0)) * cell_df['count']
+    log_scaled_count = np.log1p(cell_df['count']) / np.log1p(cell_df['count'].max())
+
+    # Final cell score
+    cell_df['cell score'] = (
+        (w_m * cell_df['mean norm'] + w_f * flatness_weight) *
+        (1 + w_c * log_scaled_count)
+    )
+
     return cell_df.sort_values(by=['count', 'cell score', 'cell', 'gene'], ascending=[False, False, False, True]).reset_index(drop=True)
 
 def run_data_processing(cluster, ensembl_ids, target_uberon_id):
     try:
-        # Step 1: Fetch expression data
         data = fetch_expression_data(cluster, ensembl_ids)
 
-        # Step 2: Convert data to DataFrame
         response_df = expression_data_to_df(data)
 
-        # Step 3: Filter data based on target UBERON ID
         filtered_df = filter_expression_data(response_df, target_uberon_id)
 
-        # Step 4: Translate ontology terms
         translated_df = translate_ontology(filtered_df)
 
-        # Step 5: Transform the results
-        transformed_df = transform_results(translated_df)
-
-        # Step 6: Rank the cells based on the calculated score
-        ranked_df = calculate_cell_score(transformed_df)
+        ranked_df = calculate_cell_score(translated_df)
 
         return ranked_df
 
@@ -195,43 +264,208 @@ def main_data_analysis(ensembl_df, target_uberon_id):
 
     return results
 
-def export_dataframe(df):
-    unique_cell = df['cell'].unique()[:20]
-    final_df = pd.DataFrame(unique_cell)
-    final_df.columns = ['cell']
-    genes, cell_score = [], []
-    for cell in unique_cell:
-        gene_list = df['gene'][df['cell'] == cell].unique()
-        score_list = df['cell score'][df['cell'] == cell].unique()
-        
-        genes.append(", ".join(map(str, gene_list)))
-        cell_score.append(", ".join(map(str, score_list)))
-    final_df['gene'], final_df['cell score'] = genes, cell_score
-    return final_df
+def export_analysis_dataframe(results):
+    ex_df = results.copy()
+    for cluster in ex_df:
+        unique_cells = ex_df[cluster]['cell'].unique()[:10]
+        ex_df[cluster] = ex_df[cluster][['gene', 'cell', 'cell score']][ex_df[cluster]['cell'].isin(unique_cells)]
+    return ex_df
 
-def get_top3_cells(df):
-    return df['cell'].unique()[:3]
 
-def export_top3_cells(results):
+#Validation
+def initialize_tavily():
+    # Initialize Tavily and Gemini clients
+    return TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
-    top3cells = pd.DataFrame()
-    for cluster in results:
-        top3cells[f'cluster {cluster}'] = get_top3_cells(results[cluster])
+def initialize_openai():
+    return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-    top3cellsT = top3cells.T.reset_index()
-    top3cellsT.columns = ['Cluster'] + list(top3cells.index)
-    top3cellsT.columns = ['Cluster', 'Cell 1', 'Cell 2', 'Cell 3']
+# Connect to PostgreSQL
+def get_db_connection():
+    return psycopg2.connect(os.getenv("DATABASE_URL"))
 
-    return top3cellsT
+def check_database(tissue_name, cell_name, gene_name):
+    query = """
+        SELECT relationcertainty FROM gene_expression
+        WHERE uberon = (
+            SELECT uberon 
+            FROM tissue 
+            WHERE tissuename = %s
+        )
+        AND cl = (
+            SELECT cl 
+            FROM cell 
+            WHERE cellname = %s
+        )
+        AND ensembl = (
+            SELECT ensembl 
+            FROM gene 
+            WHERE genename = %s
+        )
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (tissue_name, cell_name, gene_name))
+                result = cur.fetchone()
+                return result[0] if result else None
+    except Exception as e:
+        print(f"Database error: {e}")
+        return None
+    
+# Function to query Tavily using SDK
+def query_tavily(tissue_name, cell_name, gene_name, tavily_client = initialize_tavily()):
+    query = f"Does {cell_name} express {gene_name} in {tissue_name}?"
+    try:
+        response = tavily_client.search(query= query, search_depth= "basic")
+        sources = [result["url"] for result in response.get("results", [])]
+        return sources if sources else None
+    except Exception as e:
+        print(f"Tavily Error: {e}")
+        return None
+    
 
-# file_path = "10-top-cluster.csv"
-# df = csv_read(file_path)
-# clustered_df = extract_clusters(df)
-# ensembl_df = translate_genes(clustered_df)
+# Function to summarize using OpenAI
+def summarize_with_openai(tissue_name, cell_name, gene_name, sources, client = initialize_openai()):
+    prompt = f"""
+    Given the following sources, determine the confidence level that {cell_name} expresses {gene_name} in {tissue_name}.
+    Return one of these values in valid JSON format:
+    {{"status": 1.0}} → Yes
+    {{"status": 0.67}} → Mostly Yes
+    {{"status": 0.33}} → Mostly No
+    {{"status": 0.0}} → No
+    never return with markdown formatting.
+    Sources: {sources}
+    """
 
-# # Specify the UBERON ID to filter
-# TARGET_UBERON_ID = "UBERON:0002097"
-# results = main_data_analysis(ensembl_df, TARGET_UBERON_ID)
-# final_df = export_dataframe(calculate_cell_score(23, results))
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "You are an expert in cellular biology."},
+                      {"role": "user", "content": prompt}]
+        )
+        output = response.choices[0].message.content
+        return json.loads(output)["status"]
+    except Exception as e:
+        print(f"OpenAI Error: {e}")
+        return None
+    
+def insert_into_database(tissue_name, cell_name, gene_name, source_urls, certainty):
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    cur = conn.cursor()
 
-# print(final_df)
+    try:
+        # Lookup IDs
+        cur.execute("SELECT uberon FROM tissue WHERE tissuename = %s", (tissue_name,))
+        uberon = cur.fetchone()
+        if not uberon:
+            raise ValueError(f"Tissue '{tissue_name}' not found.")
+        uberon = uberon[0]
+
+        cur.execute("SELECT cl FROM cell WHERE cellname = %s", (cell_name,))
+        cl = cur.fetchone()
+        if not cl:
+            raise ValueError(f"Cell '{cell_name}' not found.")
+        cl = cl[0]
+
+        cur.execute("SELECT ensembl FROM gene WHERE genename = %s", (gene_name,))
+        ensembl = cur.fetchone()
+        if not ensembl:
+            raise ValueError(f"Gene '{gene_name}' not found.")
+        ensembl = ensembl[0]
+
+        # Insert or update gene_expression
+        cur.execute("""
+            INSERT INTO gene_expression (uberon, cl, ensembl, relationcertainty)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (uberon, cl, ensembl)
+            DO UPDATE SET relationcertainty = EXCLUDED.relationcertainty
+            RETURNING expressionid
+        """, (uberon, cl, ensembl, certainty))
+        expressionid = cur.fetchone()[0]
+
+        # Insert sources and validate links
+        for url in source_urls:
+            # Check or insert source
+            cur.execute("SELECT sourceid FROM source WHERE url = %s", (url,))
+            row = cur.fetchone()
+            if row:
+                sourceid = row[0]
+            else:
+                cur.execute("INSERT INTO source (url) VALUES (%s) RETURNING sourceid", (url,))
+                sourceid = cur.fetchone()[0]
+
+            # Insert validate link if not exists
+            cur.execute("""
+                INSERT INTO validate (expressionid, sourceid)
+                VALUES (%s, %s)
+                ON CONFLICT DO NOTHING
+            """, (expressionid, sourceid))
+
+        conn.commit()
+        print(f"✅ Inserted/Updated expressionid {expressionid} with sources.")
+
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Error: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+def validate_cell_gene_relation(tissue_name, cell_name, gene_name):
+    print(f"\n[Validation Start] Processing: {tissue_name} - {cell_name} - {gene_name}")
+
+    # Step 2: Check database first
+    stored_status = check_database(tissue_name, cell_name, gene_name)
+    if stored_status is not None:
+        print(f"[Validation] Relation already exists in DB with status {stored_status}. Skipping process.")
+        return float(stored_status)  # Ensure status is returned as a float
+
+    # Step 3: Query Tavily
+    try:
+        sources = query_tavily(tissue_name, cell_name, gene_name)
+    except Exception as e:
+        print(f"Tavily Error: {e}")
+        return None
+
+    # Step 3a: If no sources found, set status to 0.0 and insert into database
+    if not sources:
+        status = 0.0
+        print(f"[Validation] No references found in Tavily. Setting status to {status}.")
+        insert_into_database(tissue_name, cell_name, gene_name, [], status)
+        return float(status)  # Ensure status is a float
+
+    # Step 4: Summarize with OpenAI
+    status = summarize_with_openai(tissue_name, cell_name, gene_name, sources)
+    status = float(status)  # Ensure status is a float
+    print(f"[Validation] OpenAI summary status: {status}")
+
+    # Step 5: Insert into Database
+    insert_into_database(tissue_name, cell_name, gene_name, sources, status)
+    print(f"[Validation] Inserted/Updated in DB with status: {status}")
+
+    return status  # Return the validation score as a float
+
+def main_data_validation(results, target_uberon_id):
+    ex_df = results.copy()
+    for cluster in ex_df:
+        unique_cells = ex_df[cluster]['cell'].unique()[:10]
+        ex_df[cluster] = ex_df[cluster][['gene', 'cell', 'cell score']][ex_df[cluster]['cell'].isin(unique_cells)]
+    tissue_name = ontl.tissue(target_uberon_id)
+
+    for cluster in ex_df:
+        ex_df[cluster]["certainty score"] = ex_df[cluster].apply(lambda row: validate_cell_gene_relation(tissue_name, row["cell"], row["gene"]), axis=1)
+
+    return ex_df
+
+def export_validation_dataframe(results):
+    ex_df = results.copy()
+    for cluster in ex_df:
+        mean_certainty = ex_df[cluster].groupby('cell')['certainty score'].mean().reset_index().rename(columns={'certainty score': 'cell certainty'})
+        ex_df[cluster] = ex_df[cluster].merge(mean_certainty, on='cell')
+
+        unique_cells = ex_df[cluster]['cell'].unique()[:10]
+        ex_df[cluster] = ex_df[cluster][['cell', 'cell score', 'cell certainty']][ex_df[cluster]['cell'].isin(unique_cells)].drop_duplicates().reset_index(drop=True)
+    return ex_df
