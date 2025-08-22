@@ -11,13 +11,23 @@ jobs:
   sync-to-hub:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-          lfs: true
-      - name: Push "backend" folder to hub
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Push "backend" folder to Hugging Face Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          # Navigate into the subfolder
+          cd backend
+
+          # Initialize a new git repository
+          git init
+
+          # Add the Hugging Face Space as a remote
           git remote add space https://danishritonga:$HF_TOKEN@huggingface.co/spaces/danishritonga/annotacell
-          git subtree push --prefix=backend --force space main
+
+          # Add all files, commit them, and push to the 'main' branch of the remote
+          git add .
+          git commit -m "Deploy backend to Space"
+          git push --force space HEAD:main
