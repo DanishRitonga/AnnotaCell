@@ -20,4 +20,4 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           git remote add space https://danishritonga:$HF_TOKEN@huggingface.co/spaces/danishritonga/annotacell
-          git subtree push --prefix=backend space main
+          git subtree push --prefix=backend --force space main
