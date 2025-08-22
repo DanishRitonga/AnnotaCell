@@ -4,4 +4,4 @@ app = FastAPI()
 
 @app.get("/")
 def greet_json():
-    return {"Hello": "World!"}
+    return {"Hello": "World!", "Status": "Success"}
