@@ -24,6 +24,10 @@ jobs:
           # Initialize a new git repository
           git init
 
+          # Set a dummy user identity for the commit
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+
           # Add the Hugging Face Space as a remote
           git remote add space https://danishritonga:$HF_TOKEN@huggingface.co/spaces/danishritonga/annotacell
 
