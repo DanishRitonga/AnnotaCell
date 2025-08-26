@@ -2,3 +2,4 @@ cluster0.csv
 .env
 frontend/components/__pycache__/file_input.cpython-313.pyc
 frontend/components/__pycache__/file_preprocessing.cpython-313.pyc
+frontend/app.log
