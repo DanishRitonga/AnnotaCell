@@ -1,5 +1,6 @@
 import pandas as pd
 import json
+from components.ontology_translator import ontl
 
 def check_columns(df: pd.DataFrame) -> None:
     df.columns = df.columns.str.lower()
@@ -14,7 +15,14 @@ def extract_clusters(df: pd.DataFrame):
     
     return cluster_dict
 
-def translate_to_gene_ontology(cluster_dict, dictfile):
-    with open(dictfile, 'r') as f:
-        gene_ontology_dict = json.load(f)
-    
+def translate_to_ensembl(cluster_dict):
+    ontology_dict = {}
+    for cluster_id, name_list in cluster_dict.items():
+        ontology_id_list = []
+        for name in name_list:
+            ontology_id = ontl.gene(name, rev=True)
+            ontology_id_list.append(ontology_id)
+        
+        ontology_dict[cluster_id] = ontology_id_list
+
+    return ontology_dict    
