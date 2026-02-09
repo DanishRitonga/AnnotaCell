@@ -8,7 +8,6 @@ def check_columns(df: pd.DataFrame) -> None:
         raise ValueError("The input File must contain 'Cluster' and 'Gene' columns.")
 
 def extract_clusters(df: pd.DataFrame):
-    # This will raise an error and stop execution if columns are missing.
     check_columns(df) 
     grouped = df.groupby("cluster")["gene"].apply(list)
     cluster_dict = grouped.to_dict()
