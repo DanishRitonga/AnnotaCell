@@ -1,5 +1,8 @@
 cluster0.csv
 .env
+cellxgene.sqlite
+ontology.sqlite
+__pycache__/
 frontend/components/__pycache__
 frontend/app.log
 input sample.csv
