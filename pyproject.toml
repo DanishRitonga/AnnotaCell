@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "cellxgene-ontology-guide>=1.11.1",
     "fastapi>=0.162.0",
     "pandas>=3.1.0",
     "psycopg2-binary>=2.9.13",

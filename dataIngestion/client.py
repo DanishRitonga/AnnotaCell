@@ -1,8 +1,10 @@
 import logging
 import sqlite3
 from contextlib import closing
+from functools import lru_cache
 
 import requests
+from cellxgene_ontology_guide.ontology_parser import OntologyParser
 
 try:
     from .models import (
@@ -35,6 +37,16 @@ QUERY_URL = "https://api.cellxgene.cziscience.com/wmg/v2/query"
 MARKERS_URL = "https://api.cellxgene.cziscience.com/wmg/v2/markers"
 
 ORGANISM_HUMAN = "NCBITaxon:9606"
+
+_ontology = OntologyParser()
+
+
+@lru_cache(maxsize=None)
+def _children(term_id):
+    try:
+        return tuple(_ontology.get_term_children(term_id))
+    except (ValueError, KeyError):
+        return ()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tissue (
@@ -235,8 +247,20 @@ class CellxGeneClient:
     def ensembl_to_gene(self, ensembl_id):
         return self.name_for("gene", ensembl_id)
 
-    def marker_to_gene(self, ensembl_id):
-        return self.name_for("gene", ensembl_id)
+    def is_leaf(self, cell_id):
+        """True when a cell type has no descendants among the cell types known to this snapshot.
+
+        Mirrors the API's rollup semantics: ancestors carry subtree-level aggregates, so only
+        leaves represent a single cell type's own proportion.
+        """
+        known = self._known_ids()["cell"]
+        return not any(child in known for child in _children(cell_id))
+
+    def leaves(self, cell_ids=None):
+        """Filter a collection of cell types down to the leaf terms of the snapshot."""
+        if cell_ids is None:
+            cell_ids = self._known_ids()["cell"]
+        return [c for c in cell_ids if self.is_leaf(c)]
 
     def get_markers(
         self, tissue_id, cell_id, n_markers=50, test="ttest"
@@ -349,35 +373,24 @@ class CellxGeneClient:
 
     def _sanitize(self, summary: ExpressionSummary) -> ExpressionSummary:
         """Reduce an API summary to the rows the cache can represent."""
-        known = {
-            "gene": {r[0] for r in self._ids("gene")},
-            "tissue": {r[0] for r in self._ids("tissue")},
-            "cell": {r[0] for r in self._ids("cell")},
-        }
-        kept: dict[str, dict[str, dict[str, AggregatedCell]]] = {}
-        for row in summary.to_rows():
-            if (
-                row.cell == TISSUE_STATS
-                or row.gene not in known["gene"]
-                or row.tissue not in known["tissue"]
-                or row.cell not in known["cell"]
-            ):
-                continue
-            kept.setdefault(row.gene, {}).setdefault(row.tissue, {})[row.cell] = (
-                AggregatedCell(
-                    aggregated=ExpressionMetric(
-                        me=row.expression,
-                        n=row.cell_count,
-                        pc=row.cell_percentage,
-                        tpc=row.tissue_composition,
-                    )
-                )
-            )
         return ExpressionSummary(
-            expression_summary=kept,
+            expression_summary=self._summary_from_rows(
+                self._expression_rows(summary, summary.snapshot_id)
+            ),
             term_id_labels=summary.term_id_labels,
             snapshot_id=summary.snapshot_id,
         )
+
+    @staticmethod
+    def _summary_from_rows(rows) -> dict[str, dict[str, dict[str, AggregatedCell]]]:
+        """Rebuild the nested summary dict from (gene, tissue, cell, me, n, pc, tpc, ...) rows."""
+        summary: dict[str, dict[str, dict[str, AggregatedCell]]] = {}
+        for row in rows:
+            gene, tissue, cell, me, n, pc, tpc = row[:7]
+            summary.setdefault(gene, {}).setdefault(tissue, {})[cell] = AggregatedCell(
+                aggregated=ExpressionMetric(me=me, n=n, pc=pc, tpc=tpc)
+            )
+        return summary
 
     def _cached_expression(self, gene_ids, is_rollup) -> ExpressionSummary | None:
         """Rebuild an ExpressionSummary from the cache when every gene is present at this snapshot."""
@@ -399,12 +412,9 @@ class CellxGeneClient:
         if {r[0] for r in rows} != set(gene_ids):
             return None
 
-        summary: dict[str, dict[str, dict[str, AggregatedCell]]] = {}
-        for gene, tissue, cell, me, n, pc, tpc, _ in rows:
-            summary.setdefault(gene, {}).setdefault(tissue, {})[cell] = AggregatedCell(
-                aggregated=ExpressionMetric(me=me, n=n, pc=pc, tpc=tpc)
-            )
-        return ExpressionSummary(expression_summary=summary, snapshot_id=current)
+        return ExpressionSummary(
+            expression_summary=self._summary_from_rows(rows), snapshot_id=current
+        )
 
     def _observe_cell_types(self, summary: ExpressionSummary) -> None:
         """Persist cell types the /query rollup observed but /filters never listed."""
@@ -423,19 +433,13 @@ class CellxGeneClient:
 
         tissue_stats rows are dropped because they are tissue-level rollups, not cell types.
         """
-        known = {
-            "gene": {r[0] for r in self._ids("gene")},
-            "tissue": {r[0] for r in self._ids("tissue")},
-            "cell": {r[0] for r in self._ids("cell")},
-        }
+        known = self._known_ids()
         rows = []
         dropped = 0
         for row in summary.to_rows():
-            if row.cell == TISSUE_STATS:
-                dropped += 1
-                continue
             if (
-                row.gene not in known["gene"]
+                row.cell == TISSUE_STATS
+                or row.gene not in known["gene"]
                 or row.tissue not in known["tissue"]
                 or row.cell not in known["cell"]
             ):
@@ -463,3 +467,11 @@ class CellxGeneClient:
     def _ids(self, table):
         with closing(self._connect()) as conn:
             return conn.execute(f"SELECT id FROM {table}").fetchall()
+
+    def _known_ids(self) -> dict[str, set[str]]:
+        """Ids present in the vocabulary tables, used to drop FK-invalid rows before insert."""
+        return {
+            "gene": {r[0] for r in self._ids("gene")},
+            "tissue": {r[0] for r in self._ids("tissue")},
+            "cell": {r[0] for r in self._ids("cell")},
+        }
