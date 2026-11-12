@@ -36,15 +36,38 @@ PRIMARY_FILTER_URL = (
 QUERY_URL = "https://api.cellxgene.cziscience.com/wmg/v2/query"
 MARKERS_URL = "https://api.cellxgene.cziscience.com/wmg/v2/markers"
 
+FULL_MARKERS = 50
+
 ORGANISM_HUMAN = "NCBITaxon:9606"
 
 _ontology = OntologyParser()
 
 
 @lru_cache(maxsize=None)
+def _ancestors(term_id):
+    try:
+        return tuple(_ontology.get_term_ancestors(term_id, include_self=False))
+    except (ValueError, KeyError):
+        return ()
+
+
+@lru_cache(maxsize=None)
+def _ancestors_root_first(term_id):
+    return tuple(reversed(_ancestors(term_id)))
+
+
+@lru_cache(maxsize=None)
 def _children(term_id):
     try:
         return tuple(_ontology.get_term_children(term_id))
+    except (ValueError, KeyError):
+        return ()
+
+
+@lru_cache(maxsize=None)
+def _parents(term_id):
+    try:
+        return tuple(_ontology.get_term_parents(term_id))
     except (ValueError, KeyError):
         return ()
 
@@ -106,6 +129,7 @@ class CellxGeneClient:
         self.timeout = timeout
         self.session = session or requests.Session()
         self.organism = organism
+        self._non_leaves = None
         self._init_db()
 
     def _init_db(self):
@@ -247,28 +271,91 @@ class CellxGeneClient:
     def ensembl_to_gene(self, ensembl_id):
         return self.name_for("gene", ensembl_id)
 
+    def find(self, table, text):
+        """Case-insensitive substring search over a vocabulary table, ordered by name."""
+        with closing(self._connect()) as conn:
+            return conn.execute(
+                f"SELECT id, name FROM {table} WHERE name LIKE ? ORDER BY name",
+                (f"%{text}%",),
+            ).fetchall()
+
     def is_leaf(self, cell_id):
-        """True when a cell type has no descendants among the cell types known to this snapshot.
+        """True when no other cell type in this snapshot is a descendant of ``cell_id``.
 
         Mirrors the API's rollup semantics: ancestors carry subtree-level aggregates, so only
-        leaves represent a single cell type's own proportion.
+        leaves represent a single cell type's own proportion. Descendants are checked through
+        the full ancestor closure rather than direct children, because an intermediate term is
+        often absent from the snapshot while its grandchildren are present.
         """
-        known = self._known_ids()["cell"]
-        return not any(child in known for child in _children(cell_id))
+        return cell_id not in self._non_leaf_ids()
+
+    def ancestors(self, cell_id):
+        """Ancestors of a cell type, ordered root first (``cell`` -> direct parent)."""
+        return _ancestors_root_first(cell_id)
+
+    def children(self, cell_id):
+        """Direct ontology children, including terms absent from this snapshot."""
+        return _children(cell_id)
+
+    def label(self, term_id):
+        """Display name for an ontology term, falling back to the ontology package."""
+        name = self.name_for("cell", term_id)
+        if name:
+            return name
+        try:
+            return _ontology.get_term_label(term_id)
+        except (ValueError, KeyError):
+            return term_id
+
+    def lineage_path(self, cell_id):
+        """One canonical root->cell path, following the first parent at each step.
+
+        The ontology is a DAG, so ``ancestors`` returns every reachable term and
+        cannot be used as an ordered ladder. This walks a single chain instead.
+        """
+        path = [cell_id]
+        seen = {cell_id}
+        node = cell_id
+        while True:
+            parents = _parents(node)
+            if not parents:
+                break
+            node = parents[0]
+            if node in seen:
+                break
+            seen.add(node)
+            path.append(node)
+        return tuple(reversed(path))
 
     def leaves(self, cell_ids=None):
         """Filter a collection of cell types down to the leaf terms of the snapshot."""
+        non_leaves = self._non_leaf_ids()
         if cell_ids is None:
             cell_ids = self._known_ids()["cell"]
-        return [c for c in cell_ids if self.is_leaf(c)]
+        return [c for c in cell_ids if c not in non_leaves]
+
+    def _non_leaf_ids(self) -> set[str]:
+        """Every known cell type that has at least one known descendant."""
+        if self._non_leaves is None:
+            ancestors: set[str] = set()
+            for cell in self._known_ids()["cell"]:
+                ancestors.update(_ancestors(cell))
+            self._non_leaves = ancestors
+        return self._non_leaves
 
     def get_markers(
-        self, tissue_id, cell_id, n_markers=50, test="ttest"
+        self, tissue_id, cell_id, n_markers=FULL_MARKERS, test="ttest"
     ) -> list[Marker]:
-        """Fetch marker genes for a (tissue, cell type) pair, validate and cache them in SQLite."""
-        cached = self._cached_markers(tissue_id, cell_id)
-        if cached is not None:
-            return cached
+        """Fetch marker genes for a (tissue, cell type) pair, validate and cache them in SQLite.
+
+        The cache only ever holds full-length lists, so a request for fewer markers bypasses it
+        instead of risking a truncated hit.
+        """
+        cacheable = n_markers == FULL_MARKERS and test == "ttest"
+        if cacheable:
+            cached = self._cached_markers(tissue_id, cell_id)
+            if cached is not None:
+                return cached
 
         payload = {
             "tissue": tissue_id,
@@ -279,29 +366,30 @@ class CellxGeneClient:
         }
         parsed = MarkerList.model_validate(self._post(MARKERS_URL, payload))
         markers = parsed.marker_genes
-        with closing(self._connect()) as conn:
-            current = self.snapshot_id(conn)
-            snapshot = parsed.snapshot_id or current
-            conn.execute(
-                "DELETE FROM marker WHERE tissue_id = ? AND cell_id = ?",
-                (tissue_id, cell_id),
-            )
-            conn.executemany(
-                "INSERT OR REPLACE INTO marker(tissue_id, cell_id, gene_id, marker_score, specificity, snapshot_id) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                [
-                    (
-                        tissue_id,
-                        cell_id,
-                        m.gene_ontology_term_id,
-                        m.marker_score,
-                        m.specificity,
-                        snapshot,
-                    )
-                    for m in markers
-                ],
-            )
-            conn.commit()
+        if cacheable:
+            with closing(self._connect()) as conn:
+                current = self.snapshot_id(conn)
+                snapshot = parsed.snapshot_id or current
+                conn.execute(
+                    "DELETE FROM marker WHERE tissue_id = ? AND cell_id = ?",
+                    (tissue_id, cell_id),
+                )
+                conn.executemany(
+                    "INSERT OR REPLACE INTO marker(tissue_id, cell_id, gene_id, marker_score, specificity, snapshot_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            tissue_id,
+                            cell_id,
+                            m.gene_ontology_term_id,
+                            m.marker_score,
+                            m.specificity,
+                            snapshot,
+                        )
+                        for m in markers
+                    ],
+                )
+                conn.commit()
         return markers
 
     def _cached_markers(self, tissue_id, cell_id) -> list[Marker] | None:
@@ -427,6 +515,7 @@ class CellxGeneClient:
                 list(observed.items()),
             )
             conn.commit()
+        self._non_leaves = None
 
     def _expression_rows(self, summary: ExpressionSummary, snapshot) -> list[tuple]:
         """Flatten the summary into FK-valid expression rows.

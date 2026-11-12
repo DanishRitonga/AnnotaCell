@@ -8,3 +8,4 @@ frontend/app.log
 input sample.csv
 inputt.csv
 10-top-cluster.csv
+.logs/
