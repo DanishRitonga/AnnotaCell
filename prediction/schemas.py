@@ -38,6 +38,7 @@ class Prediction(BaseModel):
     score: float
     pc_wilson: float
     me_norm: float
+    vote_frac: float
     n_present: int
     eligible: bool
     rank: int

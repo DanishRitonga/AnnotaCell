@@ -15,10 +15,12 @@ from dataIngestion.client import CellxGeneClient
 from prediction.features import (
     DEFAULT_MIN_PRESENT_FRAC,
     build_lineage,
+    decision_scores,
     minimum_present,
     order_candidates,
     per_gene_max_from_summary,
     score_cells,
+    sigmoid,
 )
 from prediction.schemas import LineagePrediction, Prediction, PredictionResult
 
@@ -53,14 +55,7 @@ class CellTypePredictor:
             self.payload.get("min_present_frac", DEFAULT_MIN_PRESENT_FRAC)
         )
         self._positive = list(self.model.classes_).index(1)
-        self._leaves = None
         self._known = None
-
-    @property
-    def leaves(self):
-        if self._leaves is None:
-            self._leaves = set(self.client.leaves())
-        return self._leaves
 
     @property
     def known_cells(self):
@@ -101,15 +96,18 @@ class CellTypePredictor:
 
         min_present = minimum_present(len(present), self.min_present_frac)
         gmax = per_gene_max_from_summary(expression, present)
-        features = score_cells(expression, present, tissue_id, gmax, allowed=self.leaves)
+        candidates = self.client.tissue_leaves(tissue_id)
+        features = score_cells(expression, present, tissue_id, gmax, allowed=candidates)
         if not features:
             raise ValueError(
                 f"no cell types in {tissue_name!r} express any of the supplied genes"
             )
 
-        matrix = np.array([[f.pc_wilson, f.me_norm] for f in features.values()], dtype=float)
-        scores = self.model.predict_proba(matrix)[:, self._positive]
-        score_map = dict(zip(features, scores.tolist()))
+        matrix = np.array(
+            [[f.pc_wilson, f.me_norm, f.vote_frac] for f in features.values()], dtype=float
+        )
+        scores = sigmoid(decision_scores(self.model, matrix))
+        score_map = dict(zip(features, scores))
         ordered = order_candidates(features, score_map, min_present)
 
         predictions = []
@@ -122,6 +120,7 @@ class CellTypePredictor:
                     score=float(score_map[cell_id]),
                     pc_wilson=feature.pc_wilson,
                     me_norm=feature.me_norm,
+                    vote_frac=feature.vote_frac,
                     n_present=feature.n_present,
                     eligible=eligible,
                     rank=rank,

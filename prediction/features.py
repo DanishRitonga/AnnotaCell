@@ -6,12 +6,50 @@ features computed differently from the ones it is served.
 """
 
 from dataclasses import dataclass
-from math import ceil, sqrt
+from math import ceil, exp, log, pi, sqrt
 
 from dataIngestion.models import TISSUE_STATS
 
 DEFAULT_Z = 1.959963984540054
 DEFAULT_MIN_PRESENT_FRAC = 0.6
+VOTE_THRESHOLD = 0.5
+
+
+def decision_scores(model, x):
+    """Stable log-likelihood ratio P(class=1|x)/P(class=0|x) for a fitted GaussianNB.
+
+    ``predict_proba`` underflows to exactly 0.0 for unlikely candidates, which makes their
+    ordering arbitrary. Ranking on this ratio is mathematically identical but never saturates.
+    """
+    classes = list(model.classes_)
+    pos = classes.index(1)
+    other = 0 if pos == 1 else 1
+    theta, var, prior = model.theta_, model.var_, model.class_prior_
+    half_log_2pi = log(2.0 * pi) / 2.0
+    out = []
+    for row in x:
+        joint = []
+        for c in (other, pos):
+            total = log(prior[c])
+            for value, mean, variance in zip(row, theta[c], var[c]):
+                total -= half_log_2pi + log(variance) / 2.0 + (value - mean) ** 2 / (2.0 * variance)
+            joint.append(total)
+        out.append(joint[1] - joint[0])
+    return out
+
+
+def sigmoid(x):
+    """Numerically stable logistic, used to turn log-likelihood ratios into probabilities."""
+
+    def one(value):
+        if value >= 0:
+            return 1.0 / (1.0 + exp(-value))
+        e = exp(value)
+        return e / (1.0 + e)
+
+    if isinstance(x, (list, tuple)):
+        return [one(value) for value in x]
+    return one(x)
 
 
 def wilson(count: float, total: float, z: float = DEFAULT_Z) -> float:
@@ -73,13 +111,16 @@ class CellFeature:
     pc_wilson: float
     me_norm: float
     n_present: int
+    vote_frac: float = 0.0
 
 
 def score_rows(rows, genes, gmax) -> dict[str, CellFeature]:
     """Aggregate ``(gene, cell, me, n, pc)`` rows into one feature vector per cell type.
 
     ``pc_wilson`` and ``me_norm`` are means over the input genes the cell type
-    actually expresses; ``n_present`` is how many those were.
+    actually expresses; ``n_present`` is how many those were and ``vote_frac``
+    the share of those genes clearing :data:`VOTE_THRESHOLD`. The vote makes the
+    score robust to a few contaminant genes that pull the mean elsewhere.
     """
     wanted = set(genes)
     sums: dict[str, list[float]] = {}
@@ -88,19 +129,22 @@ def score_rows(rows, genes, gmax) -> dict[str, CellFeature]:
             continue
         acc = sums.get(cell)
         if acc is None:
-            acc = sums[cell] = [0.0, 0.0, 0.0]
-        acc[0] += wilson(n, n / pc)
+            acc = sums[cell] = [0.0, 0.0, 0.0, 0.0]
+        bound = wilson(n, n / pc)
+        acc[0] += bound
         peak = gmax.get(gene)
         acc[1] += (me or 0.0) / peak if peak and peak > 0 else 0.0
-        acc[2] += 1.0
+        acc[2] += 1.0 if bound >= VOTE_THRESHOLD else 0.0
+        acc[3] += 1.0
 
     features = {}
-    for cell, (pw, mn, count) in sums.items():
+    for cell, (pw, mn, votes, count) in sums.items():
         features[cell] = CellFeature(
             cell_id=cell,
             pc_wilson=pw / count,
             me_norm=mn / count,
             n_present=int(count),
+            vote_frac=votes / count,
         )
     return features
 

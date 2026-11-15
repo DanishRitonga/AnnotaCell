@@ -23,8 +23,10 @@ from prediction.features import (
     DEFAULT_MIN_PRESENT_FRAC,
     DEFAULT_Z,
     CellFeature,
+    decision_scores,
     minimum_present,
     order_candidates,
+    sigmoid,
     score_rows,
 )
 
@@ -43,7 +45,7 @@ NOISE_MODES = {
 ZERO = CellFeature("", 0.0, 0.0, 0)
 
 
-def load_markers(con, leaves, expr_genes):
+def load_markers(con, tissue_leaves, expr_genes, k=TOP_K_MARKERS):
     """Top-K marker genes per (tissue, leaf cell type), restricted to genes with expression data."""
     by_pair = defaultdict(list)
     for tissue, cell, gene in con.execute(
@@ -54,15 +56,15 @@ def load_markers(con, leaves, expr_genes):
 
     inputs = {}
     for (tissue, cell), genes in by_pair.items():
-        if cell not in leaves:
+        if cell not in tissue_leaves.get(tissue, ()):
             continue
-        usable = [g for g in genes if g in expr_genes][:TOP_K_MARKERS]
-        if len(usable) == TOP_K_MARKERS:
+        usable = [g for g in genes if g in expr_genes][:k]
+        if len(usable) == k:
             inputs[(tissue, cell)] = usable
     return inputs
 
 
-def load_expression(con, tissues, leaves):
+def load_expression(con, tissues, tissue_leaves):
     """Leaf-cell expression rows grouped by (tissue, gene), plus per-gene peak expression."""
     store = defaultdict(list)
     gmax = {}
@@ -72,7 +74,7 @@ def load_expression(con, tissues, leaves):
         f"WHERE tissue_id IN ({placeholders})",
         tissues,
     ):
-        if cell not in leaves:
+        if cell not in tissue_leaves.get(tissue, ()):
             continue
         store[(tissue, gene)].append((cell, me, n, pc))
         if me is not None and me > gmax.get(gene, float("-inf")):
@@ -80,11 +82,11 @@ def load_expression(con, tissues, leaves):
     return store, gmax
 
 
-def load_present(con, leaves):
+def load_present(con, tissue_leaves):
     """Leaf cell types with at least one expression row, per tissue."""
     present = defaultdict(set)
     for tissue, cell in con.execute("SELECT DISTINCT tissue_id, cell_id FROM expression"):
-        if cell in leaves:
+        if cell in tissue_leaves.get(tissue, ()):
             present[tissue].add(cell)
     return present
 
@@ -157,7 +159,6 @@ def build_samples(groups, inputs, store, gmax, present, tissue_genes, by_pair, e
 
 def evaluate(model, samples, test_keys):
     """Rank held-out groups under every noise mode and aggregate the metrics."""
-    positive = list(model.classes_).index(1)
     results = {}
     for mode in NOISE_MODES:
         ranks = []
@@ -166,10 +167,11 @@ def evaluate(model, samples, test_keys):
                 continue
             truth = key[1]
             matrix = np.array(
-                [[f.pc_wilson, f.me_norm] for f in features.values()], dtype=float
+                [[f.pc_wilson, f.me_norm, f.vote_frac] for f in features.values()],
+                dtype=float,
             )
-            scores = model.predict_proba(matrix)[:, positive]
-            score_map = dict(zip(features, scores.tolist()))
+            scores = sigmoid(decision_scores(model, matrix))
+            score_map = dict(zip(features, scores))
             ordered = order_candidates(features, score_map, minimum_present(len(genes)))
             ids = [cell for cell, _ in ordered]
             rank = ids.index(truth) + 1
@@ -192,22 +194,28 @@ def main():
     parser.add_argument("--db", default="cellxgene.sqlite")
     parser.add_argument("--out", default=str(Path(__file__).with_name("model.json")))
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--markers-per-group", type=int, default=TOP_K_MARKERS)
     args = parser.parse_args()
 
     client = CellxGeneClient(db_path=args.db)
-    leaves = set(client.leaves())
     con = sqlite3.connect(args.db)
 
+    marker_tissues = [
+        row[0] for row in con.execute("SELECT DISTINCT tissue_id FROM marker")
+    ]
+    tissue_leaves = {t: set(client.tissue_leaves(t)) for t in marker_tissues}
+
     expr_genes = {row[0] for row in con.execute("SELECT DISTINCT gene_id FROM expression")}
-    inputs = load_markers(con, leaves, expr_genes)
+    k = args.markers_per_group
+    inputs = load_markers(con, tissue_leaves, expr_genes, k)
     if not inputs:
         raise SystemExit(
-            "no training groups: no leaf cell type has 5 markers with expression data"
+            f"no training groups: no leaf cell type has {k} markers with expression data"
         )
 
     tissues = sorted({tissue for tissue, _cell in inputs})
-    store, gmax = load_expression(con, tissues, leaves)
-    present = load_present(con, leaves)
+    store, gmax = load_expression(con, tissues, tissue_leaves)
+    present = load_present(con, tissue_leaves)
     tissue_genes = load_tissue_genes(con, tissues)
 
     groups = sorted(inputs)
@@ -227,7 +235,7 @@ def main():
         if key not in train_keys:
             continue
         for feature in features.values():
-            X.append([feature.pc_wilson, feature.me_norm])
+            X.append([feature.pc_wilson, feature.me_norm, feature.vote_frac])
             y.append(1 if feature.cell_id == key[1] else 0)
 
     model = GaussianNB()
@@ -236,10 +244,10 @@ def main():
     payload = {
         "version": MODEL_VERSION,
         "snapshot_id": client.snapshot_id(),
-        "features": ["pc_wilson", "me_norm"],
+        "features": ["pc_wilson", "me_norm", "vote_frac"],
         "z": DEFAULT_Z,
         "min_present_frac": DEFAULT_MIN_PRESENT_FRAC,
-        "markers_per_group": TOP_K_MARKERS,
+        "markers_per_group": k,
         "classes": model.classes_.tolist(),
         "theta": model.theta_.tolist(),
         "var": model.var_.tolist(),

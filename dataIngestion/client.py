@@ -130,6 +130,7 @@ class CellxGeneClient:
         self.session = session or requests.Session()
         self.organism = organism
         self._non_leaves = None
+        self._tissue_leaves: dict[str, list[str]] = {}
         self._init_db()
 
     def _init_db(self):
@@ -334,6 +335,31 @@ class CellxGeneClient:
             cell_ids = self._known_ids()["cell"]
         return [c for c in cell_ids if c not in non_leaves]
 
+    def tissue_leaves(self, tissue_id):
+        """Cell types observed in a tissue that the tissue's data does not further subdivide.
+
+        A vocabulary leaf is not enough: a term can have descendants that no dataset in this
+        tissue observes, in which case the term itself carries the tissue's data. Restricting
+        candidates to this set keeps a ground-truth parent term reachable.
+        """
+        cached = self._tissue_leaves.get(tissue_id)
+        if cached is not None:
+            return cached
+        with closing(self._connect()) as conn:
+            present = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT cell_id FROM expression WHERE tissue_id = ?",
+                    (tissue_id,),
+                )
+            }
+        subdivided: set[str] = set()
+        for cell in present:
+            subdivided.update(_ancestors(cell))
+        leaves = sorted(c for c in present if c not in subdivided)
+        self._tissue_leaves[tissue_id] = leaves
+        return leaves
+
     def _non_leaf_ids(self) -> set[str]:
         """Every known cell type that has at least one known descendant."""
         if self._non_leaves is None:
@@ -516,6 +542,7 @@ class CellxGeneClient:
             )
             conn.commit()
         self._non_leaves = None
+        self._tissue_leaves.clear()
 
     def _expression_rows(self, summary: ExpressionSummary, snapshot) -> list[tuple]:
         """Flatten the summary into FK-valid expression rows.
