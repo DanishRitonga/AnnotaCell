@@ -19,6 +19,12 @@ class Verification(BaseModel):
 
     ``coverage`` is None when the API returned no marker list at all: absence of
     a marker list is not evidence against the prediction.
+
+    ``enrichment`` normalizes the overlap against the random null: observed
+    matches divided by the matches expected if ``k`` genes were drawn at random
+    from every gene expressible in the tissue. Unlike ``coverage`` it is
+    comparable across input sizes. ``p_value`` is the exact hypergeometric tail
+    P(X >= matched) under that same null.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -27,6 +33,8 @@ class Verification(BaseModel):
     matched: int = 0
     total: int = 0
     verified: bool = False
+    enrichment: float | None = None
+    p_value: float | None = None
     evidence: list[GeneEvidence] = Field(default_factory=list)
 
 

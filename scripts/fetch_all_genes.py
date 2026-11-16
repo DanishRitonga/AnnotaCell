@@ -4,7 +4,7 @@ Training uses marker genes as ground truth, so a model trained on a subset of
 them is biased toward whichever tissues that subset happened to cover. This
 fills the cache with all of them, resuming from whatever is already stored.
 
-    uv run python -m dataIngestion.fetch_all_genes --db cellxgene.sqlite
+    uv run python scripts/fetch_all_genes.py --db cellxgene.sqlite
 """
 
 import argparse
