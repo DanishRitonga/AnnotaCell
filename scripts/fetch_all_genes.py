@@ -9,8 +9,12 @@ fills the cache with all of them, resuming from whatever is already stored.
 
 import argparse
 import logging
+import sys
 import time
 from contextlib import closing
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dataIngestion.client import CellxGeneClient
 
