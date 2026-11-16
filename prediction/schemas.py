@@ -45,6 +45,42 @@ class Prediction(BaseModel):
     verification: Verification | None = None
 
 
+class Confidence(BaseModel):
+    """Label-free signals for how trustworthy the top answer is.
+
+    ``margin`` is the top1-top2 log-odds gap; a small margin means the runner-up
+    (a different lineage, since the winner is a leaf) scores almost as well,
+    which is the signature of a mixed cluster. ``n_present_ratio`` is how much
+    of the input the winner actually expressed; ``vote_frac`` the winner's share
+    of confidently-expressed genes.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    margin: float
+    n_present_ratio: float
+    vote_frac: float
+
+
+class AlternativeLineage(BaseModel):
+    """A top-ranked prediction outside the winner's subtree.
+
+    Populated in rank order; the presence of a high-scoring alternative is the
+    signature of a mixed cluster, and ``lca_depth`` says how deep the two
+    lineages diverge (0 = they only share the root).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    cell_id: str
+    cell_name: str | None = None
+    score: float
+    rank: int
+    lca_id: str | None = None
+    lca_name: str | None = None
+    lca_depth: int | None = None
+
+
 class PredictionResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -59,6 +95,8 @@ class PredictionResult(BaseModel):
     n_eligible: int = 0
     gate_relaxed: bool = False
     lineage: list[LineagePrediction] = Field(default_factory=list)
+    alternatives: list[AlternativeLineage] = Field(default_factory=list)
+    confidence: Confidence | None = None
     predictions: list[Prediction] = Field(default_factory=list)
 
 

@@ -8,6 +8,8 @@ from prediction.predict import CellTypePredictor
 from prediction.schemas import (
     GeneEvidence,
     LineagePrediction,
+    AlternativeLineage,
+    Confidence,
     Prediction,
     PredictionResult,
     Verification,

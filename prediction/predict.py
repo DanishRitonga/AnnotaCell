@@ -22,12 +22,19 @@ from prediction.features import (
     score_cells,
     sigmoid,
 )
-from prediction.schemas import LineagePrediction, Prediction, PredictionResult
+from prediction.schemas import (
+    AlternativeLineage,
+    Confidence,
+    LineagePrediction,
+    Prediction,
+    PredictionResult,
+)
 
 log = logging.getLogger(__name__)
 
 BATCH_SIZE = 6
 ENSEMBL_PREFIX = "ENSG"
+MAX_ALTERNATIVES = 3
 
 
 def load_model(path):
@@ -106,8 +113,10 @@ class CellTypePredictor:
         matrix = np.array(
             [[f.pc_wilson, f.me_norm, f.vote_frac] for f in features.values()], dtype=float
         )
-        scores = sigmoid(decision_scores(self.model, matrix))
+        decision = decision_scores(self.model, matrix)
+        scores = sigmoid(decision)
         score_map = dict(zip(features, scores))
+        decision_map = dict(zip(features, decision))
         ordered = order_candidates(features, score_map, min_present)
 
         predictions = []
@@ -128,9 +137,45 @@ class CellTypePredictor:
             )
 
         n_eligible = sum(1 for _cell, eligible in ordered if eligible)
-        lineage = []
+        lineage, alternatives, confidence = [], [], None
         if ordered:
             winner = ordered[0][0]
+            winner_feature = features[winner]
+
+            # Competing lineages: top-ranked candidates outside the winner's subtree.
+            winner_subtree = set(self.client.ancestors(winner)) | {winner}
+            winner_path = self.client.lineage_path(winner)
+            covered = set(winner_subtree)
+            for rank_pos, (cell_id, _eligible) in enumerate(ordered[:top_n], start=1):
+                if rank_pos == 1 or cell_id in covered:
+                    continue
+                subtree = set(self.client.ancestors(cell_id)) | {cell_id}
+                lca_id, lca_depth = None, None
+                for depth, term in enumerate(winner_path):
+                    if term in subtree:
+                        lca_id, lca_depth = term, depth
+                alternatives.append(
+                    AlternativeLineage(
+                        cell_id=cell_id,
+                        cell_name=self.client.name_for("cell", cell_id),
+                        score=float(score_map[cell_id]),
+                        rank=rank_pos,
+                        lca_id=lca_id,
+                        lca_name=self.client.label(lca_id) if lca_id else None,
+                        lca_depth=lca_depth,
+                    )
+                )
+                covered |= subtree
+                if len(alternatives) >= MAX_ALTERNATIVES:
+                    break
+
+            second = decision_map[ordered[1][0]] if len(ordered) > 1 else 0.0
+            confidence = Confidence(
+                margin=float(decision_map[winner] - second),
+                n_present_ratio=winner_feature.n_present / len(present),
+                vote_frac=winner_feature.vote_frac,
+            )
+
             lineage = [
                 LineagePrediction(
                     cell_id=node.cell_id,
@@ -164,6 +209,8 @@ class CellTypePredictor:
             n_eligible=n_eligible,
             gate_relaxed=n_eligible == 0,
             lineage=lineage,
+            alternatives=alternatives,
+            confidence=confidence,
             predictions=predictions,
         )
 
